@@ -1,0 +1,18 @@
+[project]
+name = "wavy"
+version = "0.1.0"
+description = "Equatorial wave (Kelvin + Rossby) screensaver for the terminal"
+readme = "README.md"
+authors = [
+    { name = "jusjoh", email = "schuetz-johannes@gmx.de" }
+]
+requires-python = ">=3.13"
+dependencies = ["numpy"]
+
+[project.scripts]
+wavy-play = "wavy.play:main"
+wavy-simulate = "wavy.simulate:main"
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
