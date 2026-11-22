@@ -85,13 +85,14 @@ Mode-dependent defaults are resolved after parsing (`Raw` → `Opts` in main.rs)
 - Waves: `--kick-every 40`.
 - ENSO: `--mu 0.42`, `--eps 0.03`, `--burst-amp 0.05`, `--burst-rate 0.025`, `--wind-x 0.3`,
   `--wind-sy 1.0`, `--init-h 0.5`, `--view sst|h`.
-- WBC: `--slip no|free` (default no), `--visc 100` (m²/s), `--view pv|zeta`, `--stretch`.
+- WBC: `--slip no|free` (default no), `--visc 100` (m²/s), `--view pv|zeta`, `--true-proportions`
+  (alias `--no-stretch`; `--stretch`, now the default, is still accepted).
 
 Keys (all modes): `q`/Ctrl-C quit, `space` pause, `+`/`-` speed x1..x10, `e` equator line,
 `h` status line, `r` restart, `?` key-help box (`?`/Esc closes). Mode keys:
 waves `k` random bump · enso `v` SST/thermocline, `k` strong westerly burst ·
 wbc `b` switch no-slip/free-slip **and restart**, `s` highlight f·q<0, `v` PV/vorticity,
-`k` small random perturbation, `a` true proportions / fill width.
+`k` small random perturbation, `a` fill width / true proportions.
 
 ## Rust architecture notes
 - **Rendering** (`render.rs`): upper half block `▀` → 2 square-ish pixels per cell (fg = top,
@@ -222,11 +223,11 @@ no-slip and free-slip lateral boundary conditions.
   ~100 m vertical scale, need vertical structure). Instead `s` highlights where f·q < 0 —
   the instability criterion (paper: fQ < 0) — in yellow (NaN → highlight colour).
 - Display: upright like the paper — north up, coast on the left, sponges hidden (visible rows
-  -300..1300 km). Drawn in **true proportions** by default: a centred strip ~0.6 × the height
-  in columns (pixels are square: 1 cell = 1 wide × 2 tall); margins blanked every frame
-  (otherwise the help box leaves residue). `a` / `--stretch` fills the width (eddies become
-  flat ellipses). PV shown as q·H/f(1000 km), vorticity as ζ/f(1000 km). Frame-dt 3 h →
-  ~4 model days per second at x1.
+  -300..1300 km). **Stretched to the full terminal width by default** (user's choice, eddies
+  become flat ellipses). `a` / `--true-proportions` switches to a centred undistorted strip
+  ~0.6 × the height in columns (pixels are square: 1 cell = 1 wide × 2 tall); its margins
+  are blanked every frame (otherwise the help box leaves residue). PV shown as
+  q·H/f(1000 km), vorticity as ζ/f(1000 km). Frame-dt 3 h → ~4 model days per second at x1.
 - Tests: `stays_bounded` (60 days both BCs: min h > 50 m, |u| < 5 m/s),
   `anomalous_pv_crosses_equator` (free-slip, 30 days, > 10 anomalous corners north of 200 km).
 
@@ -280,5 +281,8 @@ no-slip and free-slip lateral boundary conditions.
   Kelvin waves (finer grid or N/S sponges).
 - Packaging: Arch PKGBUILD building the Rust binary (`cargo build --release --locked`,
   install `/usr/bin/wavy`); no numpy / .npz needed any more.
+- Windows: works via WSL. Native needs only `term.rs` ported (termios/ioctl/poll/signals);
+  rendering is plain VT/truecolor, fine in Windows Terminal. Recommended route: `crossterm`
+  (vs. hand-written Win32 console code). User said not yet (2026-11-22).
 - README.md is empty — write user-facing docs (modes, keys, screenshots via screen2png).
 - Python simulate.py could gain the basin geometry to match Rust; play.py render loop is slow.

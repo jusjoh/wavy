@@ -58,11 +58,14 @@ ENSO mode:
   --view sst|h    start showing SST or thermocline depth          [sst]
 
 WBC mode (nonlinear 1.5-layer shallow water, SI units; north is up, the
-western coast on the left, drawn in true proportions unless --stretch):
+western coast on the left, stretched to fill the terminal width unless
+--true-proportions):
   --slip no|free  lateral boundary condition on the western wall  [no]
-  --visc NU       Laplacian viscosity in m²/s                     [300]
+  --visc NU       Laplacian viscosity in m²/s                     [100]
   --view pv|zeta  potential or relative vorticity                 [pv]
-  --stretch       fill the whole terminal width (distorts the shapes)
+  --true-proportions
+                  draw a narrow undistorted strip instead of filling
+                  the width (eddies round, not flattened)
 
 Display:
   --fps F         frames per second                               [30]
@@ -81,7 +84,7 @@ Keys: q quit | space pause | + / - speed | e equator | h status line
       v toggle view (enso: SST / thermocline, wbc: PV / vorticity)
       b switch no-slip / free-slip and restart (wbc)
       s highlight f·q < 0, the symmetric-instability criterion (wbc)
-      a true proportions / fill the screen (wbc)
+      a fill the screen / true proportions (wbc)
       ? show / hide the keys
 ";
 
@@ -142,7 +145,7 @@ struct Raw {
     gain: Option<f64>,
     no_hud: bool,
     no_equator: bool,
-    stretch: bool,
+    stretch: Option<bool>,
     snapshot: Option<f64>,
 }
 
@@ -246,7 +249,8 @@ fn parse_args() -> Result<Opts, String> {
             "--gain" => r.gain = num(&name, val("number")?)?,
             "--no-hud" => r.no_hud = true,
             "--no-equator" => r.no_equator = true,
-            "--stretch" => r.stretch = true,
+            "--stretch" => r.stretch = Some(true),
+            "--true-proportions" | "--no-stretch" => r.stretch = Some(false),
             "--snapshot" => {
                 let v = val("time")?;
                 r.snapshot = Some(match v.strip_suffix('y') {
@@ -308,7 +312,7 @@ fn parse_args() -> Result<Opts, String> {
         gain: r.gain.unwrap_or(1.0),
         hud: !r.no_hud,
         equator: !r.no_equator,
-        stretch: r.stretch,
+        stretch: r.stretch.unwrap_or(true),
         snapshot: r.snapshot,
     };
 
@@ -470,7 +474,7 @@ fn key_help(mode: Mode) -> Vec<(&'static str, &'static str)> {
             keys.push(("s", "highlight f·q < 0 (symmetric instability)"));
             keys.push(("v", "switch PV / relative vorticity"));
             keys.push(("k", "add a small random perturbation"));
-            keys.push(("a", "true proportions / fill the screen"));
+            keys.push(("a", "fill the screen / true proportions"));
         }
     }
     keys.extend([
