@@ -5,6 +5,7 @@
 //! model runs live: it is cheap enough (a few RK4 steps on a small C-grid per
 //! frame) that the animation never loops.
 
+mod kh;
 mod render;
 mod rng;
 mod solver;
@@ -16,6 +17,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use kh::{Kh, KhParams};
 use render::{AutoScale, Marker, Palette, Renderer};
 use rng::Rng;
 use solver::{Coupling, Geometry, Params, Sim, YEAR};
@@ -31,6 +33,7 @@ Modes:
   --mode enso     coupled ocean–atmosphere: El Niño / La Niña cycles
   --mode wbc      cross-equatorial western boundary current (after
                   Goldsworth, Marshall & Johnson 2021, JPO 51)
+  --mode kh       Kelvin–Helmholtz billows in a stratified shear layer
 
 Physics (linear shallow water on an equatorial beta-plane, Matsuno units:
 length ≈ 350 km, time ≈ 1.45 days, 252 units ≈ 1 year):
@@ -67,10 +70,18 @@ western coast on the left, stretched to fill the terminal width unless
                   draw a narrow undistorted strip instead of filling
                   the width (eddies round, not flattened)
 
+KH mode (2-D Boussinesq, vertical slice; units: half the shear-layer thickness
+and half the velocity difference; warm water flows right over cold water
+flowing left):
+  --ri J          minimum Richardson number, unstable below 0.25  [0.08]
+  --re RE         Reynolds number                                 [1500]
+  --cycle T       rebuild the shear layer every T units, 0 = never [150]
+  --view temp|zeta  temperature or vorticity                      [temp]
+
 Display:
   --fps F         frames per second                               [30]
   --frame-dt T    model time per frame at speed x1      [waves 0.2, enso 0.8,
-                                                         wbc 3 (hours)]
+                                                         wbc 3 (hours), kh 0.1]
   --gain G        amplitude multiplier for the colours            [1]
   --no-hud        hide the status line
   --no-equator    start without the dotted equator line
@@ -80,8 +91,12 @@ Display:
   -V, --version   show the version
 
 Keys: q quit | space pause | + / - speed | e equator | h status line
-      k kick (waves: new bump, enso: westerly wind burst) | r restart
-      v toggle view (enso: SST / thermocline, wbc: PV / vorticity)
+      k kick (waves: new bump, enso: westerly wind burst,
+        wbc/kh: random perturbation) | r restart
+      v toggle view (enso: SST / thermocline, wbc: PV / vorticity,
+        kh: temperature / vorticity)
+      [ / ] lower / raise the Richardson number (kh)
+      m rebuild the shear layer now (kh)
       b switch no-slip / free-slip and restart (wbc)
       s highlight f·q < 0, the symmetric-instability criterion (wbc)
       a fill the screen / true proportions (wbc)
@@ -93,6 +108,7 @@ enum Mode {
     Waves,
     Enso,
     Wbc,
+    Kh,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -113,6 +129,9 @@ const NINO_DEGC: f64 = 5.0;
 /// Fixed colour scales in ENSO mode — amplitude is the signal, so no auto-scaling.
 const ENSO_SST_SCALE: f64 = 0.5;
 const ENSO_H_SCALE: f64 = 1.0;
+/// Largest Richardson number and key step in KH mode.
+const KH_RI_MAX: f64 = 1.0;
+const KH_RI_STEP: f64 = 0.02;
 /// Minimum wall-clock time a wind-burst label stays in the status line.
 const BURST_LABEL_HOLD: Duration = Duration::from_secs(2);
 
@@ -138,6 +157,10 @@ struct Raw {
     init_h: Option<f64>,
     view: Option<View>,
     wbc_view: Option<WbcView>,
+    kh_vorticity: bool,
+    ri: Option<f64>,
+    re: Option<f64>,
+    cycle: Option<f64>,
     slip: Option<Slip>,
     visc: Option<f64>,
     fps: Option<f64>,
@@ -157,6 +180,8 @@ struct Opts {
     seed: Option<u64>,
     view: View,
     wbc_view: WbcView,
+    kh_vorticity: bool,
+    kh: KhParams,
     slip: Slip,
     visc: f64,
     fps: f64,
@@ -203,7 +228,8 @@ fn parse_args() -> Result<Opts, String> {
                     "waves" => Mode::Waves,
                     "enso" => Mode::Enso,
                     "wbc" => Mode::Wbc,
-                    m => return Err(format!("unknown mode {m:?} (waves|enso|wbc)")),
+                    "kh" | "kelvin-helmholtz" => Mode::Kh,
+                    m => return Err(format!("unknown mode {m:?} (waves|enso|wbc|kh)")),
                 })
             }
             "--geometry" => {
@@ -217,8 +243,12 @@ fn parse_args() -> Result<Opts, String> {
                 "sst" => r.view = Some(View::Sst),
                 "h" | "thermocline" => r.view = Some(View::Thermocline),
                 "pv" => r.wbc_view = Some(WbcView::Pv),
-                "zeta" | "vorticity" => r.wbc_view = Some(WbcView::Vorticity),
-                v => return Err(format!("unknown view {v:?} (sst|h|pv|zeta)")),
+                "temp" | "temperature" => r.kh_vorticity = false,
+                "zeta" | "vorticity" => {
+                    r.wbc_view = Some(WbcView::Vorticity);
+                    r.kh_vorticity = true;
+                }
+                v => return Err(format!("unknown view {v:?} (sst|h|pv|zeta|temp)")),
             },
             "--slip" => {
                 r.slip = Some(match val("slip")?.as_str() {
@@ -227,6 +257,9 @@ fn parse_args() -> Result<Opts, String> {
                     v => return Err(format!("unknown slip condition {v:?} (no|free)")),
                 })
             }
+            "--ri" => r.ri = num(&name, val("number")?)?,
+            "--re" => r.re = num(&name, val("number")?)?,
+            "--cycle" => r.cycle = num(&name, val("number")?)?,
             "--visc" => r.visc = num(&name, val("number")?)?,
             "--lx" => r.lx = num(&name, val("number")?)?,
             "--ly" => r.ly = num(&name, val("number")?)?,
@@ -264,7 +297,6 @@ fn parse_args() -> Result<Opts, String> {
 
     let mode = r.mode.unwrap_or(Mode::Waves);
     let enso = mode == Mode::Enso;
-    let wbc_mode = mode == Mode::Wbc;
     let pick =
         |v: Option<f64>, waves: f64, enso_v: f64| v.unwrap_or(if enso { enso_v } else { waves });
     let geometry = r.geometry.unwrap_or(Geometry::Basin);
@@ -301,14 +333,25 @@ fn parse_args() -> Result<Opts, String> {
         seed: r.seed,
         view: r.view.unwrap_or(View::Sst),
         wbc_view: r.wbc_view.unwrap_or(WbcView::Pv),
+        kh_vorticity: r.kh_vorticity,
+        kh: {
+            let d = KhParams::default();
+            KhParams {
+                ri: r.ri.unwrap_or(d.ri),
+                re: r.re.unwrap_or(d.re),
+                cycle: r.cycle.unwrap_or(d.cycle),
+                ..d
+            }
+        },
         slip: r.slip.unwrap_or(Slip::NoSlip),
         visc: r.visc.unwrap_or(WbcParams::default().nu),
         fps: r.fps.unwrap_or(30.0),
-        frame_dt: if wbc_mode {
-            r.frame_dt.unwrap_or(3.0)
-        } else {
-            pick(r.frame_dt, 0.2, 0.8)
-        },
+        frame_dt: r.frame_dt.unwrap_or(match mode {
+            Mode::Waves => 0.2,
+            Mode::Enso => 0.8,
+            Mode::Wbc => 3.0,
+            Mode::Kh => 0.1,
+        }),
         gain: r.gain.unwrap_or(1.0),
         hud: !r.no_hud,
         equator: !r.no_equator,
@@ -318,6 +361,12 @@ fn parse_args() -> Result<Opts, String> {
 
     if o.visc.is_nan() || o.visc < 0.0 {
         return Err("--visc must be non-negative".into());
+    }
+    if !(0.0..=KH_RI_MAX).contains(&o.kh.ri) {
+        return Err(format!("--ri must be in [0, {KH_RI_MAX}]"));
+    }
+    if !(o.kh.re >= 50.0 && o.kh.cycle >= 0.0) {
+        return Err("--re must be at least 50 and --cycle non-negative".into());
     }
     let p = &o.params;
     if !(0.0..0.125).contains(&p.filter) {
@@ -400,7 +449,7 @@ impl Display {
     fn gain(&self, user_gain: f64) -> f64 {
         user_gain
             / match (self.mode, self.view) {
-                (Mode::Waves | Mode::Wbc, _) => self.auto.scale,
+                (Mode::Waves | Mode::Wbc | Mode::Kh, _) => self.auto.scale,
                 (Mode::Enso, View::Sst) => ENSO_SST_SCALE,
                 (Mode::Enso, View::Thermocline) => ENSO_H_SCALE,
             }
@@ -476,13 +525,18 @@ fn key_help(mode: Mode) -> Vec<(&'static str, &'static str)> {
             keys.push(("k", "add a small random perturbation"));
             keys.push(("a", "fill the screen / true proportions"));
         }
+        Mode::Kh => {
+            keys.push(("v", "switch temperature / vorticity"));
+            keys.push(("[ / ]", "lower / raise the Richardson number"));
+            keys.push(("k", "add a random perturbation"));
+            keys.push(("m", "rebuild the shear layer now"));
+        }
     }
-    keys.extend([
-        ("r", "restart"),
-        ("e", "dotted equator line"),
-        ("h", "status line"),
-        ("?", "show / hide this help"),
-    ]);
+    keys.push(("r", "restart"));
+    if mode != Mode::Kh {
+        keys.push(("e", "dotted equator line"));
+    }
+    keys.extend([("h", "status line"), ("?", "show / hide this help")]);
     keys
 }
 
@@ -534,6 +588,9 @@ fn run(o: Opts) -> io::Result<()> {
     let seed = o.seed.unwrap_or_else(Rng::seed_from_time);
     if o.mode == Mode::Wbc {
         return run_wbc(o, seed);
+    }
+    if o.mode == Mode::Kh {
+        return run_kh(o, seed);
     }
     let geometry = o.params.geometry;
     let dt = o.params.dt;
@@ -654,7 +711,7 @@ fn run(o: Opts) -> io::Result<()> {
         if hud && rows > 0 {
             let pause = if paused { " (paused)" } else { "" };
             let (msg, spark) = match o.mode {
-                Mode::Waves | Mode::Wbc => (
+                Mode::Waves | Mode::Wbc | Mode::Kh => (
                     format!(
                         " t = {:7.1}   speed x{speed}{pause}   {}   Kelvin → east   \
                          ← Rossby west   [? keys]",
@@ -1009,6 +1066,156 @@ fn run_wbc(o: Opts, seed: u64) -> io::Result<()> {
                     }
                     b'k' => m.perturb(0.5),
                     b'a' => stretch = !stretch,
+                    b'r' => m.restart(),
+                    b'?' => help = !help,
+                    27 => help = false,
+                    _ => {}
+                }
+            }
+            if t0.elapsed() >= frame_time {
+                break;
+            }
+        }
+    }
+    drop(out);
+    drop(screen);
+    Ok(())
+}
+
+fn run_kh(o: Opts, seed: u64) -> io::Result<()> {
+    let mut m = Kh::new(o.kh.clone(), seed);
+    let steps_per_frame = ((o.frame_dt / m.dt()).round() as u32).max(1);
+    let (temp_pal, zeta_pal) = (Palette::sst(), Palette::waves());
+    let mut vorticity = o.kh_vorticity;
+    let mut renderer = Renderer::default();
+    let mut field = Vec::new();
+    let mut buf = String::new();
+    let (nx, nz) = (m.nx(), m.nz());
+
+    if let Some(t) = o.snapshot {
+        for _ in 0..(t / m.dt()).round() as u64 {
+            m.step();
+        }
+        let (cols, rows) = if term::stdout_is_tty() {
+            term::size()
+        } else {
+            (100, 30)
+        };
+        m.field(vorticity, &mut field);
+        let pal = if vorticity { &zeta_pal } else { &temp_pal };
+        renderer.render(
+            &mut buf,
+            &field,
+            nx,
+            nz,
+            cols,
+            rows,
+            o.gain,
+            Marker::None,
+            pal,
+        );
+        buf.push_str("\x1b[0m\n");
+        io::stdout().lock().write_all(buf.as_bytes())?;
+        let (om, th) = m.max_abs();
+        let (w_rms, phase) = (m.w_rms(), m.phase());
+        eprintln!(
+            "t {:.1}  {}  w_rms = {:.3}  min Ri = {:.3}  max |ω| = {om:.2}  max |θ| = {th:.2}  seed = {seed}",
+            m.t,
+            phase.name(),
+            w_rms,
+            m.min_ri(),
+        );
+        return Ok(());
+    }
+
+    term::install_signal_handlers();
+    let screen = term::Screen::enter()?;
+    let interactive = term::stdin_is_tty();
+    let frame_time = Duration::from_secs_f64(1.0 / o.fps);
+    let (mut speed, mut paused, mut hud, mut help) = (1u32, false, o.hud, false);
+    let mut keybuf = [0u8; 32];
+    let mut last_size = (0, 0);
+    let mut out = io::stdout().lock();
+
+    'outer: while !term::quit_requested() {
+        let t0 = Instant::now();
+        if !paused {
+            for _ in 0..speed * steps_per_frame {
+                m.step();
+            }
+        }
+
+        let (cols, rows) = term::size();
+        buf.clear();
+        if (cols, rows) != last_size {
+            buf.push_str("\x1b[0m\x1b[2J");
+            last_size = (cols, rows);
+        }
+        let body_rows = if hud { rows.saturating_sub(1) } else { rows };
+        m.field(vorticity, &mut field);
+        let pal = if vorticity { &zeta_pal } else { &temp_pal };
+        renderer.render(
+            &mut buf,
+            &field,
+            nx,
+            nz,
+            cols,
+            body_rows,
+            o.gain,
+            Marker::None,
+            pal,
+        );
+        if help {
+            draw_help(&mut buf, o.mode, cols, body_rows);
+        }
+        if hud && rows > 0 {
+            let pause = if paused { " (paused)" } else { "" };
+            let v = if vorticity {
+                "vorticity"
+            } else {
+                "temperature"
+            };
+            let phase = m.phase();
+            let regime = if m.ri() < 0.25 { "unstable" } else { "stable" };
+            let msg = format!(
+                " t {:7.1}  x{speed:<2}{pause:<9} Ri {:.2} {regime:<8}  mean-flow Ri {:5.2}  \
+                 {:<10}  {v:<11}  [? keys]",
+                m.t,
+                m.ri(),
+                m.min_ri().clamp(-9.99, 99.99),
+                phase.name(),
+            );
+            let msg: String = msg.chars().take(cols).collect();
+            buf.push_str(&format!("\x1b[{rows};1H\x1b[0m\x1b[2K{msg}"));
+        }
+        out.write_all(buf.as_bytes())?;
+        out.flush()?;
+
+        // polled at least once per frame, see run_wbc
+        loop {
+            if term::quit_requested() {
+                break;
+            }
+            let left = frame_time.saturating_sub(t0.elapsed());
+            if !interactive {
+                std::thread::sleep(left);
+                break;
+            }
+            for &k in term::poll_keys(left.as_millis() as i32, &mut keybuf) {
+                match k {
+                    b'q' | b'Q' | 3 | 4 => break 'outer,
+                    b' ' => paused = !paused,
+                    b'+' | b'=' => speed = (speed + 1).min(10),
+                    b'-' | b'_' => speed = speed.saturating_sub(1).max(1),
+                    b'h' => {
+                        hud = !hud;
+                        last_size = (0, 0);
+                    }
+                    b'[' => m.set_ri((m.ri() - KH_RI_STEP).max(0.0)),
+                    b']' => m.set_ri((m.ri() + KH_RI_STEP).min(KH_RI_MAX)),
+                    b'v' => vorticity = !vorticity,
+                    b'k' => m.perturb(0.1),
+                    b'm' => m.rebuild(),
                     b'r' => m.restart(),
                     b'?' => help = !help,
                     27 => help = false,

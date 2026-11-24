@@ -1,17 +1,18 @@
 # wavy — equatorial ocean dynamics as a terminal screensaver
 
 Inspired by `pipes.sh` (Arch package, github.com/pipeseroni/pipes.sh): a full-screen
-terminal animation, but showing equatorial ocean physics. Three modes:
+terminal animation, but showing equatorial ocean physics. Four modes:
 
 | mode | what | model |
 |---|---|---|
 | `waves` (default) | free equatorial Kelvin + Rossby waves, random height bumps | linear shallow water, Matsuno units |
 | `enso` | El Niño / La Niña cycles | linear ocean + SST + Bjerknes wind feedback (stripped-down Cane–Zebiak) |
 | `wbc` | cross-equatorial western boundary current, no-slip vs free-slip | nonlinear 1.5-layer shallow water, SI units |
+| `kh` | Kelvin–Helmholtz billows in a stratified shear layer | 2-D Boussinesq x–z slice, vorticity–streamfunction |
 
 Two implementations:
 - **`wavy/` — Rust, the shipped executable.** Simulates *live* while rendering, never loops.
-  All three modes.
+  All four modes.
 - **`src/wavy/` — Python, research/prototyping.** Precompute-then-play for the waves
   mode, plus the ENSO prototype used for parameter tuning (with plots). No WBC prototype.
 
@@ -37,6 +38,7 @@ wavy/                 Rust crate (binary `wavy`), only dependency: libc
   src/main.rs            CLI, mode dispatch, frame loops, HUD, help box, WBC display layout
   src/solver.rs          linear equatorial shallow water (waves + enso modes), wind bursts
   src/wbc.rs             nonlinear 1.5-layer WBC model (wbc mode)
+  src/kh.rs              2-D Boussinesq KH model, own FFT + Poisson solver (kh mode)
   src/render.rs          truecolor half-block renderer, palettes, auto colour scale
   src/term.rs            termios/alt-screen/poll/ioctl/signals via libc
   src/rng.rs             SplitMix64 + Box–Muller (no rand crate)
@@ -46,6 +48,7 @@ src/wavy/       Python package (uv project, pyproject.toml)
   enso.py                ENSO prototype: basin solver + SST + coupling, diagnostics, plots
   enso_scan.py           parallel parameter scans over enso.py
 tools/screen2png.py      ANSI terminal capture -> PNG (visual testing, see "Testing")
+tools/co2.py             CO2 estimate from Claude Code's local token logs (stdlib only; rates are guesses)
 ```
 
 ## Toolchains and commands
@@ -57,7 +60,7 @@ tools/screen2png.py      ANSI terminal capture -> PNG (visual testing, see "Test
 ```
 cd wavy
 cargo build --release                       # -> wavy/target/release/wavy
-cargo test --release                        # 6 tests, ~12 s
+cargo test --release                        # 10 tests, ~12 s
 cargo clippy --release --all-targets        # kept at zero warnings
 cargo fmt
 cargo install --path wavy                # (from repo root) puts wavy in ~/.cargo/bin
@@ -65,6 +68,7 @@ cargo install --path wavy                # (from repo root) puts wavy in ~/.carg
 ./target/release/wavy                    # waves
 ./target/release/wavy --mode enso
 ./target/release/wavy --mode wbc [--slip no|free]
+./target/release/wavy --mode kh [--ri 0.08]
 ./target/release/wavy --help             # all options
 
 uv run wavy-simulate && uv run wavy-play waves.npz       # Python waves
@@ -76,8 +80,8 @@ uv run --with matplotlib python -m wavy.enso_scan OUTDIR '{"mu":[0.38,0.42],"yea
 Options are case-insensitive (`--Lx` works) and accept `--opt value` or `--opt=value`.
 Mode-dependent defaults are resolved after parsing (`Raw` → `Opts` in main.rs).
 
-- Common: `--mode waves|enso|wbc`, `--fps 30`, `--frame-dt` (model time per frame at x1:
-  waves 0.2, enso 0.8 [Matsuno units], wbc 3 [hours]), `--gain`, `--no-hud`, `--no-equator`,
+- Common: `--mode waves|enso|wbc|kh`, `--fps 30`, `--frame-dt` (model time per frame at x1:
+  waves 0.2, enso 0.8 [Matsuno units], wbc 3 [hours], kh 0.1), `--gain`, `--no-hud`, `--no-equator`,
   `--seed N` (default from clock), `--snapshot T` (simulate to T, print one frame to stdout,
   stats to stderr, exit; `30y` = years; in wbc T is days, `35` or `35d`).
 - Linear model: `--geometry basin|channel`, `--lx 40`, `--ly 8`, `--nx/--ny` (waves 200x80,
@@ -87,12 +91,15 @@ Mode-dependent defaults are resolved after parsing (`Raw` → `Opts` in main.rs)
   `--wind-sy 1.0`, `--init-h 0.5`, `--view sst|h`.
 - WBC: `--slip no|free` (default no), `--visc 100` (m²/s), `--view pv|zeta`, `--true-proportions`
   (alias `--no-stretch`; `--stretch`, now the default, is still accepted).
+- KH: `--ri 0.08`, `--re 1500`, `--cycle 150` (0 = never rebuild), `--view temp|zeta`.
 
 Keys (all modes): `q`/Ctrl-C quit, `space` pause, `+`/`-` speed x1..x10, `e` equator line,
 `h` status line, `r` restart, `?` key-help box (`?`/Esc closes). Mode keys:
 waves `k` random bump · enso `v` SST/thermocline, `k` strong westerly burst ·
 wbc `b` switch no-slip/free-slip **and restart**, `s` highlight f·q<0, `v` PV/vorticity,
-`k` small random perturbation, `a` fill width / true proportions.
+`k` small random perturbation, `a` fill width / true proportions ·
+kh `v` temperature/vorticity, `[`/`]` Richardson number ∓0.02, `k` random perturbation,
+`m` rebuild the shear layer now (no equator line in kh).
 
 ## Rust architecture notes
 - **Rendering** (`render.rs`): upper half block `▀` → 2 square-ish pixels per cell (fg = top,
@@ -110,7 +117,7 @@ wbc `b` switch no-slip/free-slip **and restart**, `s` highlight f·q<0, `v` PV/v
   restored by `Drop` (also on panic). Ctrl-C arrives as byte 3 (ISIG off); SIGINT/TERM/HUP
   handlers set a flag. Size via TIOCGWINSZ, fallback $COLUMNS/$LINES, then 100x30 (snapshot
   to a pipe uses 100x30).
-- **Frame loops** (two: `run` for waves/enso, `run_wbc`): step the model `speed ×
+- **Frame loops** (three: `run` for waves/enso, `run_wbc`, `run_kh`): step the model `speed ×
   steps_per_frame` times, render, then wait out the frame while handling keys. Input is
   **always polled at least once per frame** — before that fix, frames slower than the
   budget (wbc at x10) never read keys, not even `q`.
@@ -120,6 +127,7 @@ wbc `b` switch no-slip/free-slip **and restart**, `s` highlight f·q<0, `v` PV/v
   Niño-3 sparkline (last up to 240 months). The help box is drawn after the field, centred.
 - **Performance**: waves ~0.5 ms/step (200x80), enso ~0.17 ms/step (100x40), wbc ~0.6 ms/step
   (80x200, f32). Waves/enso hold 30 fps at x10; wbc drops to ~18 fps at x10 (55 ms/frame).
+  kh ~2 ms/step (256x128, f32), one step per frame at x1, holds 30 fps at x10.
   All solvers use row-slice loops with edge cases outside the inner loop (bounds checks
   elided, vectorised) — rewrites from naive indexing gave 1.5–1.75x.
 
@@ -231,6 +239,29 @@ no-slip and free-slip lateral boundary conditions.
 - Tests: `stays_bounded` (60 days both BCs: min h > 50 m, |u| < 5 m/s),
   `anomalous_pv_crosses_equator` (free-slip, 30 days, > 10 anomalous corners north of 200 km).
 
+## Mode: kh — Kelvin–Helmholtz instability (kh.rs)
+Not equatorial: a vertical x–z slice. Units: half shear-layer thickness, half velocity jump.
+
+    ω_t + u·∇ω = -J θ_x + ∇²ω/Re      θ_t + u·∇θ = ∇²θ/Re      ∇²ψ = ω, u = ψ_z, w = -ψ_x
+
+- Background U = θ = tanh z (warm on top), so min gradient Ri = J at z = 0; unstable for
+  J < 1/4. Periodic in x, free-slip lids. Domain 56 x 28 (four fastest-growing billows),
+  256x128, dt 0.1, J 0.08, Re 1500, Pr 1. Fills the screen (no true-proportions option).
+- Cell-centred; face velocities from corner ψ (exactly non-divergent); 5th-order upwind fluxes
+  (implicit LES), **θ limited** (universal limiter — without it |θ| overshot to 1.4); SSP-RK3;
+  Poisson = own radix-2 FFT in x (nx power of two, nz even) + Thomas in z. 512x256 works
+  (dt 0.05) but costs ~10 ms/step before the FFT speed-up.
+- FFT twiddles are stored contiguously per stage so the butterflies vectorise (-40 %).
+- A free layer mixes once and stays stable, so every `cycle` 150 units ω and θ relax to the
+  background (rate 0.2 for 20 units, a model device, HUD "rebuilding"), then new long-wave noise
+  (0.02) seeds the next set. Billows at t ≈ 30, pairing ≈ 55, turbulence ≈ 80–130.
+- HUD "Ri" = J of the background; "mean-flow Ri" = min of the x-mean profiles (negative while
+  overturning). w_rms < 0.05 in |z| < 2 = "laminar".
+- 2-D only: real billows break down through 3-D secondary instabilities, so the late turbulence
+  here is 2-D (pairing, inverse cascade).
+- Tests: Poisson residual; growth rate 0.1897 ± 0.006 at k = 0.4446, J = 0 (Michalke 1964);
+  Miles–Howard (J = 0.1 grows, J = 0.3 does not); bounded over two cycles (|θ| < 1.05).
+
 ## Python side (src/wavy/)
 - `simulate.py` is the **channel-only** version (periodic in x, kick-every 30, damping 0.008,
   200x80, dt 0.04, t 0..400, ~17 s). The basin geometry exists only in Rust (and enso.py has
@@ -248,7 +279,7 @@ no-slip and free-slip lateral boundary conditions.
 
 ## Testing and verification recipes
 - Unit tests: `cargo test --release` (solver: energy, closed basin mass, Kelvin speed, ENSO
-  oscillation; wbc: bounded, anomalous PV crosses the equator).
+  oscillation; wbc: bounded, anomalous PV crosses the equator; kh: see the mode section).
 - Physics cross-checks against Python were done via `--snapshot` stderr numbers (energy,
   Niño-3) — reproduce with the values quoted above.
 - **Visual checks without a terminal**: render a snapshot or a live run in a pseudo-terminal
